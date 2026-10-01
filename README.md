@@ -1,6 +1,15 @@
-# Repair-AzVMDisk 0.9.4 (preview)
+# Repair-AzVMDisk 0.9.5 (preview)
 
-Temporary preview build of [Repair-AzVMDisk](https://github.com/mvaferreira/RepairAzVMDisk). This repository will be deleted once 0.9.4 is released in the main repository.
+Temporary preview build of [Repair-AzVMDisk](https://github.com/mvaferreira/RepairAzVMDisk). This repository will be deleted once 0.9.5 is released in the main repository.
+
+New in 0.9.5:
+
+- `-SysCheck` area filters: `-BootOnly`, `-RDPOnly`, `-ConnectivityOnly`, `-UpdateOnly` and `-SecurityOnly`. They combine (for example `-SysCheck -BootOnly -RDPOnly`), and the other areas' checks are skipped rather than hidden, so a focused check finishes much faster. Disk/file-system, control-set and OS information are always reported.
+- `-SysCheck -SaveOutput` also writes the full output to `Repair-AzVMDisk_SysCheck.txt` next to the script, replacing the previous file on each run. Under Windows PowerShell 5.1 the file begins with the standard transcript header (computer and user name).
+
+```powershell
+.\Repair-AzVMDisk.ps1 -DiskNumber 3 -SysCheck -BootOnly -RDPOnly -SaveOutput
+```
 
 New in 0.9.4:
 
@@ -24,6 +33,6 @@ New in 0.9.2:
 
 [Download ZIP](https://github.com/mvaferreira/RepairAzVMDisk-preview/archive/refs/heads/main.zip)
 
-`Repair-AzVMDisk.ps1` SHA256: `69F55C84F7B01DAF6C734AF2E2E156E2052A46A3F72677F33A7B23E10E43183A`
+`Repair-AzVMDisk.ps1` SHA256: `B396FAD25C707C246DF8586379A149D935325CA3FDB48859FC52FC463C59C619`
 
 Usage and documentation: see the [main repository](https://github.com/mvaferreira/RepairAzVMDisk).
