@@ -2352,16 +2352,42 @@ exit `$exitCode
 
     # Resolves an offline guest ImagePath (\SystemRoot\, %SystemRoot%, system32\, C:\, etc.)
     # to a local path on the attached drive letter. Strips the trailing extension match too.
+    # Pass the raw REG_EXPAND_SZ value: anything already expanded by the registry provider was
+    # expanded against the rescue VM's environment, not the guest's.
     function Resolve-GuestImagePath {
         param([string]$ImagePath)
         $drive = $script:WinDriveLetter.TrimEnd('\')
         $resolved = $ImagePath `
             -replace '(?i)\\SystemRoot\\', "$drive\Windows\" `
             -replace '(?i)%SystemRoot%', "$drive\Windows" `
+            -replace '(?i)%windir%', "$drive\Windows" `
+            -replace '(?i)%ProgramFiles\(x86\)%', "$drive\Program Files (x86)" `
+            -replace '(?i)%(?:ProgramFiles|ProgramW6432)%', "$drive\Program Files" `
+            -replace '(?i)%CommonProgramFiles\(x86\)%', "$drive\Program Files (x86)\Common Files" `
+            -replace '(?i)%(?:CommonProgramFiles|CommonProgramW6432)%', "$drive\Program Files\Common Files" `
+            -replace '(?i)%ProgramData%', "$drive\ProgramData" `
+            -replace '(?i)%SystemDrive%', $drive `
             -replace '(?i)\\\?\?\\', '' `
             -replace '(?i)^system32\\', "$drive\Windows\System32\" `
             -replace '(?i)^"?[A-Z]:\\', "$drive\"
         if ($resolved -match '^(.+?\.(?:sys|exe|dll))') { $resolved = $Matches[1] }
+        return $resolved
+    }
+
+    # Resolves a raw (unexpanded) NetworkProvider ProviderPath to a path on the attached
+    # offline disk. MPR loads the provider with LoadLibrary, so a bare file name resolves
+    # from System32. Returns $null when the value still holds an environment variable the
+    # guest defines but this script cannot map (for example a per-user variable): such a
+    # path cannot be verified offline, so it must not be reported as missing.
+    function Resolve-NetworkProviderDllPath {
+        param([string]$ProviderPath)
+        if ([string]::IsNullOrWhiteSpace($ProviderPath)) { return $null }
+        $raw = $ProviderPath.Trim().Trim('"')
+        if ($raw -notmatch '[\\/%]') {
+            return ($script:WinDriveLetter.TrimEnd('\') + "\Windows\System32\$raw")
+        }
+        $resolved = Resolve-GuestImagePath $raw
+        if ($resolved -match '%[^%\\]+%') { return $null }
         return $resolved
     }
 
@@ -15502,7 +15528,7 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
         $sevNetSvcDisabled = 1   # Secondary networking services disabled (DNS/DHCP/NLA/SMB)
         $sevNsiDisabled = 2   # nsi (Network Store Interface) disabled - total networking loss
         $sevStaticIpNoAzureDhcp = 2   # EnableDHCP=0 on NIC - VM gets no Azure IP assignment
-        $sevNetProviderOrphaned = 2   # NetworkProvider\Order lists a provider whose DLL is missing - logon hangs forever
+        $sevNetProviderOrphaned = 2   # NetworkProvider\Order lists a provider whose DLL is missing - logon can stall
         $sevSanPolicy = 0   # SAN policy is not OnlineAll
         $sevOrphanedNdis = 2   # Orphaned NDIS bindings with missing binary
 
@@ -17326,9 +17352,10 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                 }
 
                 # -- NetworkProvider\Order orphan check --------------------------------
-                # If a provider is listed in ProviderOrder but its DLL is missing,
-                # Windows hangs indefinitely at logon ("Please wait..." forever).
-                # Common after uninstalling VPN software (Cisco AnyConnect, GlobalProtect, Zscaler).
+                # A provider listed in ProviderOrder whose DLL is missing can stall logon
+                # ("Please wait..."). Common after uninstalling VPN or remote-access software.
+                # ProviderPath is read raw: Get-ItemProperty would expand %SystemRoot% and
+                # %ProgramFiles% against the rescue VM, not the guest.
                 $npOrderPath = "$ctrlRoot\NetworkProvider\Order"
                 if (Test-Path $npOrderPath) {
                     $providerOrder = (Get-ItemProperty $npOrderPath -ErrorAction SilentlyContinue).ProviderOrder
@@ -17341,17 +17368,21 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                                 $orphanedProviders.Add("$prov (service key missing)")
                                 continue
                             }
-                            $provDllRaw = (Get-ItemProperty $provSvcPath -ErrorAction SilentlyContinue).ProviderPath
-                            if (-not $provDllRaw) { continue }
-                            # Resolve %SystemRoot% and map to offline drive
-                            $provDll = $provDllRaw -replace '(?i)%SystemRoot%', (Join-Path $script:WinDriveLetter 'Windows')
-                            $provDll = $provDll -replace '(?i)\\SystemRoot\\', (Join-Path $script:WinDriveLetter 'Windows\')
-                            if (-not (Test-Path -LiteralPath $provDll)) {
-                                $orphanedProviders.Add("$prov ($provDllRaw -> not found)")
+                            $provDllRaw = $null
+                            $provKey = Get-Item -LiteralPath $provSvcPath -ErrorAction SilentlyContinue
+                            if ($provKey) {
+                                try { $provDllRaw = $provKey.GetValue('ProviderPath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+                                finally { $provKey.Close() }
+                            }
+                            if ($provDllRaw -isnot [string] -or -not $provDllRaw.Trim()) { continue }
+                            $provDll = Resolve-NetworkProviderDllPath $provDllRaw
+                            if (-not $provDll) { continue }
+                            if (-not (Test-Path -LiteralPath $provDll -PathType Leaf)) {
+                                $orphanedProviders.Add("$prov ($provDllRaw -> $provDll not found)")
                             }
                         }
                         if ($orphanedProviders.Count -gt 0) {
-                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon will hang indefinitely: $($orphanedProviders -join '; ')" "-FixNetBindings"
+                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon can stall at 'Please wait': $($orphanedProviders -join '; ')" "Manual: remove the listed name(s) from Control\NetworkProvider\Order ProviderOrder (and HwOrder) in the offline SYSTEM hive, after confirming the software is really uninstalled"
                         }
                     }
                 }
