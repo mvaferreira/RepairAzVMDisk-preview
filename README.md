@@ -12,6 +12,6 @@ New in 0.9.2:
 
 [Download ZIP](https://github.com/mvaferreira/RepairAzVMDisk-preview/archive/refs/heads/main.zip)
 
-`Repair-AzVMDisk.ps1` SHA256: `A2BCCFE365CE4224C1919DDF6BA46CFAAFFA7C4E5E603525D58BA9AEC82040FA`
+`Repair-AzVMDisk.ps1` SHA256: `D4EFB151B17CEA6599CD5D1F4385560E9968EA8E1FD754E60922BD4DCFC0DF4B`
 
 Usage and documentation: see the [main repository](https://github.com/mvaferreira/RepairAzVMDisk).

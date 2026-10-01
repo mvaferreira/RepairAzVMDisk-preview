@@ -7835,11 +7835,13 @@ namespace RepairAzVMDisk {
         $cand = [ordered]@{}
         $parsed = 0
         $latestLog = $null
+        $logsByFile = @{}
         foreach ($f in $files) {
             $log = Read-UefiTcgLog -Path $f.FullName
             if ($log.Error) { continue }
             $parsed++
             if (-not $latestLog) { $latestLog = $log }
+            $logsByFile[[string]$log.File] = $log
             foreach ($e in $log.Entries) {
                 if ($e.Description -ne 'Windows Boot Manager' -or -not $e.HD -or $e.HD.SigType -ne 2) { continue }
                 if ($e.FilePath -notmatch '(?i)bootmgfw\.efi') { continue }
@@ -7915,8 +7917,8 @@ namespace RepairAzVMDisk {
         }
 
         # Azure Trusted Launch / CVM keep their saved 'Windows Boot Manager' entry and match it on GUID
-        # + GPT slot, with no \EFI\Boot fallback. Hyper-V and Standard-security VMs start without that
-        # entry, so a boot there says nothing about Azure TL.
+        # + GPT slot. Hyper-V and Standard-security VMs start without that entry, so a boot there says
+        # nothing about Azure TL.
         $fwEntry = if ($target -and $target.Slot) { $target }
         elseif ($current.Count -gt 0) { $current | Sort-Object -Property LastSeen -Descending | Select-Object -First 1 }
         else { $null }
@@ -7930,6 +7932,38 @@ namespace RepairAzVMDisk {
                 else { 'Match' }
             }
             default { 'Unknown' }
+        }
+
+        # When the saved entry misses, the firmware moves on down its saved BootOrder. Many TL VMs also
+        # keep an 'EFI SCSI Device' entry (a whole-disk path with no HD node), which loads
+        # \EFI\Boot\bootx64.efi from the first FAT partition that has it - the ESP, unless a stray
+        # FAT \EFI copy sits earlier on the disk.
+        $strayEfi = @(Find-StrayEfiFolder -DiskNumber $DiskNumber)
+        $strayFatCount = @($strayEfi | Where-Object { $_.IsFat }).Count
+        $fwLog = if ($fwEntry -and $fwEntry.LastLog -and $logsByFile.ContainsKey([string]$fwEntry.LastLog)) { $logsByFile[[string]$fwEntry.LastLog] } else { $latestLog }
+        $fallbackEntry = $null
+        if ($fwLog) {
+            foreach ($bn in @($fwLog.BootOrder)) {
+                $be = @($fwLog.Entries | Where-Object { $_.Name -eq $bn }) | Select-Object -First 1
+                if ($be -and $be.Active -and -not $be.HD -and $be.Path -match 'Scsi\(') { $fallbackEntry = $be; break }
+            }
+        }
+        $fallbackBooted = $false
+        if ($fwLog -and $espGuidNow) {
+            $fallbackBooted = @($fwLog.Loaded | Where-Object {
+                    $_.HD -and $_.HD.Guid -eq $espGuidNow -and (-not $espSlot -or $_.HD.PartitionNumber -eq $espSlot) -and
+                    $_.FilePath -match '(?i)\\EFI\\Boot\\bootx64\.efi$'
+                }).Count -gt 0
+        }
+        $espBootFile = $null
+        if ($esp) {
+            $espRoot = @($esp.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' }) + @($esp.AccessPaths | Where-Object { $_ -match '^\\\\\?\\Volume' }) | Select-Object -First 1
+            if ($espRoot) {
+                try { $espBootFile = [bool](Test-Path -LiteralPath ($espRoot.TrimEnd('\') + '\EFI\Boot\bootx64.efi')) } catch { $espBootFile = $null }
+            }
+        }
+        if ($azureVerdict -eq 'NoMatch' -and $fallbackEntry -and $strayFatCount -eq 0 -and $espBootFile -ne $false) {
+            $azureVerdict = 'Fallback'
         }
 
         return [pscustomobject]@{
@@ -7951,7 +7985,11 @@ namespace RepairAzVMDisk {
             SlotMismatch  = $slotMismatch
             AzureEntry    = $fwEntry
             AzureVerdict  = $azureVerdict
-            StrayEfi      = @(Find-StrayEfiFolder -DiskNumber $DiskNumber)
+            AzureLog      = $fwLog
+            FallbackEntry = $fallbackEntry
+            FallbackBooted = $fallbackBooted
+            EspBootFile   = $espBootFile
+            StrayEfi      = $strayEfi
         }
     }
 
@@ -7959,17 +7997,27 @@ namespace RepairAzVMDisk {
         param($Analysis)
         $a = $Analysis
         $e = $a.AzureEntry
-        $notProof = 'A boot on Hyper-V or on a Standard-security VM does not prove Azure TL will boot: those start with no saved entry and fall back to \EFI\Boot\bootx64.efi.'
+        $notProof = 'A boot on Hyper-V or on a Standard-security VM does not prove Azure TL will boot: those start with no saved entries and always fall back to \EFI\Boot\bootx64.efi.'
+        $eSlot = if ($e -and $e.Slot) { $e.Slot } else { '?' }
+        $eGuid = if ($e) { $e.Guid } else { '?' }
+        $fbName = if ($a.FallbackEntry) { "$($a.FallbackEntry.Name) '$($a.FallbackEntry.Description)'" } else { '' }
         switch ($a.AzureVerdict) {
             'Match' { return "should boot - the ESP has the GUID ($($a.EspGuid)) and GPT slot ($($a.EspSlot)) of the saved 'Windows Boot Manager' entry." }
+            'Fallback' {
+                $proof = if ($a.FallbackBooted) { " The firmware already did this: $($a.AzureLog.File) shows \EFI\Boot\bootx64.efi loaded from this ESP." } else { '' }
+                return "should boot through the fallback - the saved 'Windows Boot Manager' entry expects GUID $eGuid in GPT slot $eSlot and will miss (ESP: GUID $($a.EspGuid), slot $($a.EspSlot)), but the saved boot order continues to $fbName, which loads \EFI\Boot\bootx64.efi from the ESP.$proof"
+            }
             'NoMatch' {
-                $eSlot = if ($e -and $e.Slot) { $e.Slot } else { '?' }
-                $eGuid = if ($e) { $e.Guid } else { '?' }
-                return "will NOT boot - the saved entry expects GUID $eGuid in GPT slot $eSlot; the ESP has GUID $($a.EspGuid) in slot $($a.EspSlot). $notProof"
+                $why = if (@($a.StrayEfi | Where-Object { $_.IsFat }).Count -gt 0) { ' A stray FAT \EFI copy would win the \EFI\Boot fallback; run -FixUefiBootEntry to rename it.' }
+                elseif ($a.FallbackEntry -and $a.EspBootFile -eq $false) { ' The ESP has no \EFI\Boot\bootx64.efi for the fallback entry to load.' }
+                elseif (-not $a.FallbackEntry -and $a.AzureLog) { " The saved boot order ($(@($a.AzureLog.BootOrder) -join ', ')) has no 'EFI SCSI Device' fallback entry." }
+                else { '' }
+                return "will NOT boot - the saved entry expects GUID $eGuid in GPT slot $eSlot; the ESP has GUID $($a.EspGuid) in slot $($a.EspSlot).$why $notProof"
             }
             'NoEsp' {
                 $after = if (-not $e -or -not $e.Slot) { '' }
                 elseif ($a.PredictedSlot -and $e.Slot -and $a.PredictedSlot -eq $e.Slot) { " After -RecreateBootPartition the ESP will be back in GPT slot $($e.Slot) with GUID $($e.Guid), matching the saved entry." }
+                elseif ($a.FallbackEntry) { " -RecreateBootPartition cannot put the ESP back in GPT slot $($e.Slot) (predicted slot: $(if ($a.PredictedSlot) { $a.PredictedSlot } else { 'unknown - old extent in use' })), but the saved boot order has the fallback $fbName, which will load \EFI\Boot\bootx64.efi from the recreated ESP." }
                 else { " -RecreateBootPartition cannot put the ESP back in GPT slot $($e.Slot) (predicted slot: $(if ($a.PredictedSlot) { $a.PredictedSlot } else { 'unknown - old extent in use' })); reset the VM guest state or use a Standard-security VM." }
                 return "will NOT boot - there is no EFI System Partition.$after $notProof"
             }
@@ -8021,9 +8069,12 @@ namespace RepairAzVMDisk {
         }
         $color = switch ($a.Status) { 'Match' { 'Green' } 'Stale' { 'Red' } 'NoEsp' { 'Red' } default { 'Yellow' } }
         Write-Host "  Result          : $($a.Status) - $(Get-UefiBootStatusText -Analysis $a)" -ForegroundColor $color
-        $color = switch ($a.AzureVerdict) { 'Match' { 'Green' } 'Unknown' { 'Yellow' } default { 'Red' } }
+        $color = switch ($a.AzureVerdict) { 'Match' { 'Green' } 'Fallback' { if ($a.FallbackBooted) { 'Green' } else { 'Yellow' } } 'Unknown' { 'Yellow' } default { 'Red' } }
         Write-Host "  Azure TL / CVM  : $(Get-UefiAzureVerdictText -Analysis $a)" -ForegroundColor $color
-        if ($a.SlotMismatch) {
+        if ($a.SlotMismatch -and ($a.AzureVerdict -eq 'Fallback' -or ($a.Status -eq 'NoEsp' -and $a.FallbackEntry))) {
+            Write-Host "  Slot mismatch   : the firmware entry uses GPT slot $($a.Target.Slot) but the ESP $(if ($a.EspSlot) { "is in slot $($a.EspSlot)" } else { "would be created in slot $($a.PredictedSlot)" }). No action needed: the saved fallback entry covers it." -ForegroundColor Gray
+        }
+        elseif ($a.SlotMismatch) {
             Write-Host "  Slot mismatch   : the firmware entry uses GPT slot $($a.Target.Slot) but the ESP $(if ($a.EspSlot) { "is in slot $($a.EspSlot)" } else { "would be created in slot $($a.PredictedSlot)" }). Restoring the GUID alone will not match it; reset the VM's UEFI boot entries instead (for Trusted Launch, reset the VM guest state)." -ForegroundColor Yellow
         }
     }
@@ -15875,21 +15926,35 @@ RpcSs, TLS settings, service protection arguments, Select values and other Contr
                         & $emit 'BCD' (& $toSev $sevStrayEfiNtfs) "Non-ESP $($s.FileSystem) partition $($s.PartitionNumber) holds EFI boot files ($($s.Path)) - not used by the firmware, but may confuse repairs" ''
                     }
                 }
+                $fbNote = if ($uefiA.AzureVerdict -eq 'Fallback') { " Trusted Launch/CVM will still boot through the saved fallback entry $($uefiA.FallbackEntry.Name) '$($uefiA.FallbackEntry.Description)' (\EFI\Boot\bootx64.efi on the ESP)$(if ($uefiA.FallbackBooted) { ', as the newest measured boot log already shows' })." } else { '' }
                 switch ($uefiA.Status) {
                     'Match' {
-                        if ($uefiA.AzureVerdict -eq 'NoMatch') {
+                        if ($uefiA.AzureVerdict -eq 'Fallback') {
+                            & $emit 'BCD' 'INFO' "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot).$fbNote" ''
+                        }
+                        elseif ($uefiA.AzureVerdict -eq 'NoMatch') {
                             & $emit 'BCD' (& $toSev $sevUefiEntryStale) "ESP GUID matches the firmware's 'Windows Boot Manager' entry, but the entry uses GPT slot $($uefiA.AzureEntry.Slot) and the ESP is in slot $($uefiA.EspSlot) - Trusted Launch/CVM will not find the boot loader; reset the VM guest state." ''
                         }
                         else { & $emit 'BCD' 'OK' "ESP GUID and GPT slot match the firmware's most recent 'Windows Boot Manager' entry" }
                     }
                     'Stale' {
-                        $slotNote = if ($uefiA.SlotMismatch) { " GPT slot also differs (entry slot $($uefiA.Target.Slot)); reset the VM guest state instead." } else { '' }
-                        & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        if ($uefiA.AzureVerdict -eq 'Fallback') {
+                            & $emit 'BCD' 'INFO' "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)).$fbNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        }
+                        else {
+                            $slotNote = if ($uefiA.SlotMismatch) { " GPT slot also differs (entry slot $($uefiA.Target.Slot)); reset the VM guest state instead." } else { '' }
+                            & $emit 'BCD' (& $toSev $sevUefiEntryStale) "Firmware 'Windows Boot Manager' entry points at ESP GUID $($uefiA.Target.Guid), which is no longer on the disk (current ESP: $($uefiA.EspGuid)) - Trusted Launch/CVM will not find the boot loader.$slotNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        }
                     }
                     'Mixed' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP GUID matches an older firmware 'Windows Boot Manager' entry, but a newer boot recorded a different GUID (disk booted on another host?)" '-GetUefiBootEntry' }
                     'Replaced' {
-                        $slotNote = if ($uefiA.SlotMismatch) { " GPT slot also differs (entry slot $($uefiA.Target.Slot)); reset the VM guest state instead." } else { '' }
-                        & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)). If the VM fails to boot in Azure (Trusted Launch/CVM), restore the previous GUID.$slotNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        if ($uefiA.AzureVerdict -eq 'Fallback') {
+                            & $emit 'BCD' 'INFO' "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)).$fbNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        }
+                        else {
+                            $slotNote = if ($uefiA.SlotMismatch) { " GPT slot also differs (entry slot $($uefiA.Target.Slot)); reset the VM guest state instead." } else { '' }
+                            & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "ESP was recreated: previous ESP GUID $($uefiA.Target.Guid) (GPT slot $($uefiA.Target.Slot)) is no longer on the disk (current ESP: $($uefiA.EspGuid)). If the VM fails to boot in Azure (Trusted Launch/CVM), restore the previous GUID.$slotNote" $(if ($uefiA.SlotMismatch) { '' } else { '-FixUefiBootEntry' })
+                        }
                     }
                     'Ambiguous' { & $emit 'BCD' (& $toSev $sevUefiEntryMixed) "Recorded firmware 'Windows Boot Manager' GUIDs belong to other partitions, not the ESP" '-GetUefiBootEntry' }
                     'MultipleEsp' { & $emit 'BCD' 'WARN' "More than one EFI System Partition on the disk" '-GetUefiBootEntry' }
