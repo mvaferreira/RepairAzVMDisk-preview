@@ -1,6 +1,11 @@
-# Repair-AzVMDisk 0.9.3 (preview)
+# Repair-AzVMDisk 0.9.4 (preview)
 
-Temporary preview build of [Repair-AzVMDisk](https://github.com/mvaferreira/RepairAzVMDisk). This repository will be deleted once 0.9.3 is released in the main repository.
+Temporary preview build of [Repair-AzVMDisk](https://github.com/mvaferreira/RepairAzVMDisk). This repository will be deleted once 0.9.4 is released in the main repository.
+
+New in 0.9.4:
+
+- When the Measured Boot logs record the ESP GUID under more than one GPT slot (for example after the disk was booted once on nested Hyper-V), `-GetUefiBootEntry`, `-SysCheck` and `-FixUefiBootEntry` now use the slot the firmware recorded most often - the one the Azure VM's saved 'Windows Boot Manager' entry points to - instead of the newest sighting. The other sightings are listed, and a tie is reported instead of guessed.
+- `-SysCheck` and `-GetUefiBootEntry` report which Secure Boot CA signed the ESP boot manager (Windows Production PCA 2011 or Windows UEFI CA 2023), read from the file's embedded signature, and check it against the Secure Boot `db` / `dbx` recorded in the newest Measured Boot log. A CA 2023-signed boot manager on a platform whose `db` lacks that CA (such as an older Hyper-V Gen2 VM) is flagged, since Secure Boot refuses it there with "The boot loader failed".
 
 New in 0.9.3:
 
@@ -19,6 +24,6 @@ New in 0.9.2:
 
 [Download ZIP](https://github.com/mvaferreira/RepairAzVMDisk-preview/archive/refs/heads/main.zip)
 
-`Repair-AzVMDisk.ps1` SHA256: `05EFC8F5E76B708DE57EA41A710EB2520CC0E317DE72A83E6C9F1702020839CA`
+`Repair-AzVMDisk.ps1` SHA256: `E8EBFBE6B092CD8B121EEEC5CCBFBE8EA5314739C9F4E807B8EE0365D966A65C`
 
 Usage and documentation: see the [main repository](https://github.com/mvaferreira/RepairAzVMDisk).
