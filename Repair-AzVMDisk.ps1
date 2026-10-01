@@ -8555,6 +8555,17 @@ namespace RepairAzVMDisk {
                 Write-Host "  Secure Boot dbx: revokes Windows Production PCA 2011 = $(& $yn $a.LatestLog.DbxPca2011)"
             }
         }
+        if ($script:BootDriveLetter) {
+            $caNames = @{ UefiCa2023 = 'Windows UEFI CA 2023'; Pca2011 = 'Windows Production PCA 2011'; Unknown = 'no signature found' }
+            foreach ($rel in @('EFI\Microsoft\Boot\bootmgfw.efi', 'EFI\Boot\bootx64.efi')) {
+                $p = Join-Path $script:BootDriveLetter $rel
+                $fi = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                if (-not ($fi -and $fi.Length -gt 0)) { continue }
+                $sig = Get-UefiBootManagerSigner -Path $p
+                $who = if ($caNames.ContainsKey($sig.Ca)) { $caNames[$sig.Ca] } else { "other CA ($($sig.Issuer))" }
+                Write-Host "  Signed by      : \$rel -> $who"
+            }
+        }
         if ($a.Status -eq 'NoEsp') {
             Write-Host "`nTo repair: .\Repair-AzVMDisk.ps1 -DiskNumber $($script:DiskNumber) -RecreateBootPartition" -ForegroundColor Yellow
         }
